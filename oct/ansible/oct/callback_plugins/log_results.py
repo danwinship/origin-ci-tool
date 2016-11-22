@@ -1,6 +1,7 @@
 # coding=utf-8
 from __future__ import absolute_import, division, print_function, unicode_literals
 
+from copy import deepcopy
 from datetime import datetime
 from shutil import rmtree
 from tempfile import mkdtemp
@@ -411,3 +412,71 @@ class CallbackModule(CallbackBase):
         #                                confirm=False, salt_size=None, salt=None, default=None):
         # def v2_on_file_diff(self, result):
         # def v2_playbook_on_stats(self, stats):
+
+
+from structlog import get_logger
+
+logger = get_logger()
+
+
+def sanitize(ansible_object):
+    # sanitize the data to remove Ansible
+    # internal fields that the user doesn't
+    # need in their output files
+    sanitized_object = deepcopy(ansible_object)
+    for key in sanitized_object.keys():
+        if key.startswith('_ansible'):
+            del sanitized_object[key]
+
+    return sanitized_object
+
+
+def santitize_result(ansible_result):
+    # remove `stdout_lines` if `stdout` is
+    # present -- we can let people load the
+    # data and format it however they want,
+    # but we don't want to store it twice
+    sanitized_result = deepcopy(ansible_result)
+    if 'results' in sanitized_result:
+        for result in sanitized_result['results']:
+            if 'stdout' in result and 'stdout_lines' in result:
+                del result['stdout_lines']
+
+    return sanitize(sanitized_result)
+
+
+def callback_generic_event(func):
+    def wrapper(*args, **kwargs):
+        logger.bind(callback=func.__name__)
+        func(*args, **kwargs)
+        logger.unbind('callback')
+
+    return wrapper
+
+
+def callback_result_event(func):
+    def wrapper(callback_module, raw_result, *args, **kwargs):
+        host = raw_result._host.get_name()
+        result = santitize_result(raw_result._result)
+        ansible_workload_reference = {
+            'uuid': raw_result._task._uuid,
+            'type': 'task'
+        }
+        logger.bind(host=host, result=result, ansible_workload_reference=ansible_workload_reference)
+        callback_generic_event(func)(callback_module, raw_result, *args, **kwargs)
+        logger.unbind('host', 'result', 'ansible_workload_reference')
+
+    return wrapper
+
+
+def callback_start_event(func):
+    def wrapper(callback_module, ansible_workload, *args, **kwargs):
+        ansible_workload_reference = {
+            'uuid': ansible_workload._uuid,
+            'type': type(ansible_workload).__name__.lower()
+        }
+        logger.bind(ansible_workload_reference=ansible_workload_reference)
+        callback_generic_event(func)(callback_module, ansible_workload, *args, **kwargs)
+        logger.unbind('ansible_workload_reference')
+
+    return wrapper
